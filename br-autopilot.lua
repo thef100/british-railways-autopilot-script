@@ -243,13 +243,48 @@ local function finishGuardMenuTransition(now, train)
     GuardMenu.SyncedTrain = train
 end
 
-local ups = getupvalues(TrainHandling.trainSpawned)
-local u0 = ups[5]
-local ActivityQueue = ups[20]
-local trainData = ups[21]
 local guardModule = DriverGuardHandler
-local sInfo = u0.signalInfo
-local u16Value = getupvalues(ActivityQueue.routeRenderStepUpdate)[9]
+
+local function readUpvalues(callback)
+    if type(callback) ~= "function" then return {} end
+    local ok, values = pcall(getupvalues, callback)
+    return ok and type(values) == "table" and values or {}
+end
+
+local function hasGetter(value)
+    return type(value) == "table" and type(value.get) == "function"
+end
+
+local function getCurrentTrainData(upvalues)
+    upvalues = upvalues or readUpvalues(TrainHandling.trainSpawned)
+    for _, value in pairs(upvalues) do
+        if type(value) == "table" and type(value.speed) == "number"
+            and typeof(value.model) == "Instance" then
+            return value
+        end
+    end
+end
+
+local function readDriverUpvalues()
+    local upvalues = readUpvalues(TrainHandling.trainSpawned)
+    local signals, activityQueue
+    for _, value in pairs(upvalues) do
+        if type(value) == "table" then
+            local info = value.signalInfo
+            if type(info) == "table" and hasGetter(info.signalId) and hasGetter(info.signalType)
+                and hasGetter(info.signalState) and hasGetter(info.dist) then
+                signals = info
+            end
+            if type(value.routeRenderStepUpdate) == "function"
+                and type(value.getNextStop) == "function"
+                and type(value.getNextDeparture) == "function"
+                and type(value.getNextActivity) == "function" then
+                activityQueue = value
+            end
+        end
+    end
+    return getCurrentTrainData(upvalues), signals, activityQueue
+end
 local liveTrackLimit = 60
 pcall(function()
     Triggers:add("LimitChanged", function(newLimit)
@@ -463,7 +498,7 @@ local DriverGuardControl = {
 
 local function readDriverGuardContext(td)
     if not GameplayStates.isDriving or isGuarding() then return nil end
-    if not td then td = getupvalues(TrainHandling.trainSpawned)[21] end
+    if not td then td = getCurrentTrainData() end
     local model = td and td.model
     local guard = model and model:GetAttribute("Guard")
     if type(guard) ~= "string" or guard == "" then return nil end
@@ -996,16 +1031,6 @@ local keyConn = UserInputService.InputBegan:Connect(function(input, gpe)
         setAutopilot(not State.Enabled)
     end
 end)
-local function getCurrentTrainData()
-    local ok, upvalues = pcall(function()
-        return getupvalues(TrainHandling.trainSpawned)
-    end)
-    if ok and upvalues and upvalues[21] then
-        return upvalues[21]
-    end
-    return trainData
-end
-
 local METERS_PER_MILE = 1609.344
 local MPS_PER_MPH = 0.44704
 
@@ -1319,11 +1344,19 @@ local function driveToSpeed(ctx, targetMph, plannedDecel)
 end
 
 
-local function updateSignalState(hasBuffer, bufferDist)
-    local rawSignalId = sInfo and sInfo.signalId and sInfo.signalId:get() or ""
-    local rawSignalType = sInfo and sInfo.signalType and sInfo.signalType:get() or ""
-    local rawSignalState = sInfo and sInfo.signalState and sInfo.signalState:get() or 2
-    local rawSignalDist = sInfo and sInfo.dist and sInfo.dist:get() or 999
+local function updateSignalState(sInfo, hasBuffer, bufferDist)
+    local rawSignalId = sInfo and sInfo.signalId:get()
+    local rawSignalType = sInfo and sInfo.signalType:get()
+    local rawSignalState = sInfo and sInfo.signalState:get()
+    local rawSignalDist = sInfo and sInfo.dist:get()
+
+    if type(rawSignalId) ~= "string" or type(rawSignalType) ~= "string"
+        or not isFiniteNumber(rawSignalState) or not isFiniteNumber(rawSignalDist) then
+        State.CurrentSignalId = "None"
+        State.CurrentSignalDist = 999
+        State.CurrentSignalState = "UNAVAILABLE"
+        return false, false, false, 999, false
+    end
 
     local validSignal =
         rawSignalType ~= ""
@@ -1363,7 +1396,7 @@ local function updateSignalState(hasBuffer, bufferDist)
         State.CurrentSignalState = "CLEAR"
     end
 
-    return validSignal, isRed, isYellow, rawSignalDist
+    return validSignal, isRed, isYellow, rawSignalDist, true
 end
 
 local function syncDriverRoute(td)
@@ -1398,7 +1431,7 @@ local function readRuntimeSnapshot()
             now - State.LastControlTime, State.ControlInterval * 0.9)
     end
     State.LastControlTime = now
-    local currentTrainData = getCurrentTrainData()
+    local currentTrainData, sInfo, ActivityQueue = readDriverUpvalues()
     syncDriverRoute(currentTrainData)
     updateTrainPhysics(currentTrainData)
     local currentSpeed = currentTrainData and currentTrainData.speed or 0
@@ -1413,7 +1446,9 @@ local function readRuntimeSnapshot()
 
     local doorsOpenNative, atPlatformNative, _, doorsStateKnown = getDoorsStateNative()
 
-    local stationText = u16Value and u16Value:get() or "None"
+    local stationValue = ActivityQueue and readUpvalues(ActivityQueue.routeRenderStepUpdate)[9]
+    local stationText = hasGetter(stationValue) and stationValue:get()
+    if type(stationText) ~= "string" then stationText = "None" end
     local stationTextAtPlatform =
         stationText == "At Platform"
         or stationText == "Arrived"
@@ -1433,13 +1468,13 @@ local function readRuntimeSnapshot()
         end
     end
 
-    local hasMarker = sInfo and sInfo.renderMarker and sInfo.renderMarker:get() or false
-    local markerDistance = sInfo and sInfo.markerDist and sInfo.markerDist:get() or 999
-    local hasBuffer = sInfo and sInfo.renderBuffer and sInfo.renderBuffer:get() or false
-    local bufferDistance = sInfo and sInfo.bufferDist and sInfo.bufferDist:get() or 999
+    local hasMarker = sInfo and hasGetter(sInfo.renderMarker) and sInfo.renderMarker:get() or false
+    local markerDistance = sInfo and hasGetter(sInfo.markerDist) and sInfo.markerDist:get() or 999
+    local hasBuffer = sInfo and hasGetter(sInfo.renderBuffer) and sInfo.renderBuffer:get() or false
+    local bufferDistance = sInfo and hasGetter(sInfo.bufferDist) and sInfo.bufferDist:get() or 999
 
-    local validSignal, isRed, isYellow, signalDistance =
-        updateSignalState(hasBuffer, bufferDistance)
+    local validSignal, isRed, isYellow, signalDistance, signalDataReady =
+        updateSignalState(sInfo, hasBuffer, bufferDistance)
 
     local nextStop = ActivityQueue and ActivityQueue:getNextStop()
     local nextDeparture = ActivityQueue and ActivityQueue:getNextDeparture()
@@ -1546,6 +1581,7 @@ local function readRuntimeSnapshot()
         currentSpeed = currentSpeed,
         driverGuard = readDriverGuardContext(currentTrainData),
         controlTime = now,
+        signalDataReady = signalDataReady,
         trainAvailable = currentTrainData and isFiniteNumber(currentTrainData.speed)
             and isFiniteNumber(currentTrainData.maxSpeed) and currentTrainData.maxSpeed > 0,
         speedLimit = speedLimit,
@@ -1907,6 +1943,11 @@ local function runAutopilot(ctx)
     if Inputs:getThrottleType() == "SpeedSet" then
         holdStopped()
         State.CurrentPhase = "SELECT SIMPLIFIED CONTROLS"
+        return
+    end
+    if not ctx.signalDataReady then
+        holdStopped()
+        State.CurrentPhase = "WAITING FOR SIGNAL DATA"
         return
     end
     if handleDriverGuardStation(ctx) then return end
